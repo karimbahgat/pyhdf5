@@ -105,6 +105,34 @@ class _FileWrap(object):
 
     def return_to_checkpoint(self):
         self.fileobj.seek(self.pos, 0) # absolute position
+
+
+class _BaseObject(object):
+    def __init__(self, parent, fileobj=None, **kwargs):
+        self.parent = parent
+        
+        if fileobj:
+            self.fileobj = fileobj
+            self.pos = fileobj.tell()
+            self.read()
+        else:
+            # set superblock attrs from kwargs...
+            raise NotImplementedError("Building from scratch not yet supported")
+
+    def __str__(self):
+        from pprint import pformat
+        return "----- \n %r \n %s"%(self, pformat(self.__dict__, indent=4) )
+
+    def get_root(self):
+        obj = self
+        while hasattr(obj, "parent") and not isinstance(obj.parent, _SuperBlock):
+            obj = obj.parent
+
+        return obj
+
+    def _read_reserved(self, n):
+        val = self.fileobj.read_struct_type("B", n) # singlebyte unsigned nr
+        assert val == 0 
         
 
 class _SuperBlock(object):
@@ -293,7 +321,96 @@ class _SuperBlock(object):
 
 
 
-class _BTreeNode(object):
+class _v1BTreeNode(_BaseObject):
+
+    def get_root_node(self):
+        obj = self
+        while hasattr(obj, "parent") and isinstance(obj.parent, _v1BTreeNode):
+            obj = obj.parent
+
+        obj = obj.parent
+        return obj
+
+    def read(self):
+        self.fileobj.seek(self.pos)
+        
+        self._read_signature()
+        self._read_node_type()
+        self._read_node_level()
+        self._read_entries_used() 
+        self._read_address_left()
+        self._read_address_right()
+        self._read_keys()
+        #self._read_k2_pluss_1()
+
+    def _read_signature(self):
+        self.signature = self.fileobj.read_struct_type("s", 4)
+        assert self.signature == "TREE"
+
+    def _read_node_type(self):
+        self.node_type = self.fileobj.read_struct_type("B", 1)
+        assert self.node_type in (0,1)
+
+    def _read_node_level(self):
+        self.node_level = self.fileobj.read_struct_type("B", 1)
+
+    def _read_entries_used(self):
+        "number of children"
+        self.entries_used = self.fileobj.read_struct_type("H", 1)
+
+    def _read_address_left(self):
+        superblock = self.get_root().parent
+        self.address_left = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
+
+    def _read_address_right(self):
+        superblock = self.get_root().parent
+        self.address_right = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
+
+    def _read_keys(self):
+        superblock = self.get_root().parent
+        self.keys = list()
+        
+        if self.node_type == 0:
+            for _ in range(self.entries_used):
+                # key
+                key = dict(offset=self.fileobj.read_unknown_nr(superblock.length_size, 1))
+                # address
+                address = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
+
+                self.keys.append(dict(key=key, address=address))
+
+        elif self.node_type == 1:
+            dataspace = next((msg["msgdata"] for msg in self.get_root_node().parent.parent.messages if msg["msgtype"] == 1))
+            for _ in range(self.entries_used):
+                # key
+                raw = self.fileobj.read_bytes(1)
+                key = dict(chunksize=_bitfield(raw,0,3),
+                           filtermask=_bitfield(raw,4,7),
+                           offsets=list(),
+                           )
+                for _ in range(dataspace.dimensionality):
+                    key["offsets"].append(self.fileobj.read_struct_type("Q",1))
+                key["offsets"].append(0)
+                # address
+                address = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
+
+                self.keys.append(dict(key=key, address=address))
+
+    def read_data(self):
+        # traverse the keys
+        # depending on level, type, and keyinfo, offset and seek to address for data or subtree
+        # ...
+        pass
+
+class _v2BTreeHeader(object):
+    def __init__(self):
+        pass
+
+class _v2BTreeNode(object):
+    def __init__(self):
+        pass
+
+class _v2BTreeLeafNode(object):
     def __init__(self):
         pass
 
@@ -504,13 +621,15 @@ class _ObjectHeaderPrefix(object):
                     )
 
     def _read_msgdata(self, msg):
+        cur = self.fileobj.tell()
+        
         if msg["msgflags"]["sharestore"]:
             data = _SharedMessage(parent=self, fileobj=self.fileobj)
+
         else:
             typ = msg["msgtype"]
             if typ == 0:
                 # skip the nil msg
-                self.fileobj.read_bytes(msg["msgdatasize"])
                 data = None
             elif typ == 1:
                 data = _DataspaceMessage(parent=self, fileobj=self.fileobj)
@@ -518,14 +637,21 @@ class _ObjectHeaderPrefix(object):
                 data = _LinkInfoMessage(parent=self, fileobj=self.fileobj)
             elif typ == 3:
                 data = _DataTypeMessage(parent=self, fileobj=self.fileobj)
+            elif typ == 5:
+                data = _FillValueMessage(parent=self, fileobj=self.fileobj)
             elif typ == 6:
                 data = _LinkMessage(parent=self, fileobj=self.fileobj)
+            elif typ == 8:
+                data = _DataLayoutMessage(parent=self, fileobj=self.fileobj)
+                print "LAYOUT",data
             elif typ == 10:
                 data = _HeaderContMessage(parent=self, fileobj=self.fileobj)
             else:
-                raise NotImplementedError("Message type %s not yet supported" % typ)
+                data = "NOT YET SUPPORTED" #raise NotImplementedError("Message type %s not yet supported" % typ)
 
-            return data
+        self.fileobj.seek(cur + msg["msgdatasize"])
+
+        return data
 
     def _read_checksum(self):
         # TODO: Not sure how to parse checksum...
@@ -640,9 +766,19 @@ class _DataspaceMessage(object):
             self.dimsizes = (self._read_dimension_size() for _ in range(self.dimensionality))
 
             if self.flags["maxdims"]:
-                self.maxdimsizes = (self._read_maxdimsize() for _ in range(self.dimensionality))
+                self.maxdimsizes = [self._read_maxdim_size() for _ in range(self.dimensionality)]
             if self.flags["permutindices"]:
-                self.permutindices = (self._read_permuation_index() for _ in range(self.dimensionality))
+                self.permutindices = [self._read_permuation_index() for _ in range(self.dimensionality)]
+
+        elif self.version == 2:
+            self._read_dimensionality()
+            self._read_flags()
+            self._read_type()
+
+            self.dimsizes = [self._read_dimension_size() for _ in range(self.dimensionality)]
+
+            if self.flags["maxdims"]:
+                self.maxdimsizes = [self._read_maxdim_size() for _ in range(self.dimensionality)]
             
     def _read_version(self):
         self.version = self.fileobj.read_struct_type("B", 1) # 1-byte nr
@@ -659,17 +795,20 @@ class _DataspaceMessage(object):
         # skip a single reserved byte
         self.fileobj.read_bytes(n)
 
-    def _read_dimensionsize(self):
+    def _read_dimension_size(self):
         superblock = self.get_root().parent
         return self.fileobj.read_unknown_nr(superblock.length_size, 1) 
 
-    def _read_maxdimsize(self):
+    def _read_maxdim_size(self):
         superblock = self.get_root().parent
         return self.fileobj.read_unknown_nr(superblock.length_size, 1)
 
     def _read_permutation_index(self):
         superblock = self.get_root().parent
-        return self.fileobj.read_unknown_nr(superblock.length_size, 1) 
+        return self.fileobj.read_unknown_nr(superblock.length_size, 1)
+
+    def _read_type(self):
+        self.type = self.fileobj.read_struct_type("B", 1)
 
 
 class _LinkInfoMessage(object):
@@ -954,26 +1093,191 @@ class _DataTypeMessage(object):
 
             
 
-###
-    
-if __name__ == "__main__":
-    testfile = HDF5("C:\Users\kimo\Downloads\spei01.nc")
-    
-    print testfile.superblock
-    
-    root = testfile.get_root()
-    print root
-    
-    print root.prefix
 
-    for msg in root.messages:
-        print "msg:",msg["msgdata"]
+class _DataLayoutMessage(object):
+    def __init__(self, parent, fileobj=None):
+        self.parent = parent
+        
+        if fileobj:
+            self.fileobj = fileobj
+            self.read()
+        else:
+            # set superblock attrs from kwargs...
+            raise NotImplementedError("Building from scratch not yet supported")
+
+    def __str__(self):
+        from pprint import pformat
+        return "----- \n %r \n %s"%(self, pformat(self.__dict__, indent=4) )
+
+    def get_root(self):
+        obj = self
+        while hasattr(obj, "parent") and not isinstance(obj.parent, _SuperBlock):
+            obj = obj.parent
+
+        return obj
+
+    def read(self):
+        if not hasattr(self, "fileobj"):
+            raise Exception("Must be initiated with a fileobj in order to call read()")
+
+        self._read_version()
+
+        if self.version in (1,2):
+            self._read_dimensionality()
+            self._read_layout_class()
+            self._read_reserved(1+4)
+
+            if self.layout_class != "compact":
+                self._read_data_address()
+
+            #self._read_dimensions()
+
+            #self._read_dataset_element_size()
+            #self._read_compact_data_size()
+            #self._read_compact_data()
+
+        elif self.version == 3:
+            self._read_layout_class()
+            self._read_properties()
+
+    def _read_version(self):
+        self.version = self.fileobj.read_struct_type("B", 1)
+
+    def _read_dimensionality(self):
+        self.dimensionality = self.fileobj.read_struct_type("B", 1)
+
+    def _read_layout_class(self):
+        val = self.fileobj.read_struct_type("B", 1)
+        self.layout_class = {0: "compact",
+                             1: "contiguous",
+                             2: "chunked"}[val]
+
+    def _read_reserved(self, n):
+        self.fileobj.read_bytes(n)
+
+    def _read_data_address():
+        superblock = self.get_root().parent
+        self.data_address = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
+
+    def _read_properties(self):
+        self.properties = dict()
+
+        if self.version == 3:
+        
+            if self.layout_class == "compact":
+                self.properties["size"] = self.fileobj.read_unknown_nr(2, 1)
+                self.properties["address"] = self.fileobj.tell() # original format does not use an address field, but we do since we dont want to read it right away
+
+            elif self.layout_class == "contiguous":
+                superblock = self.get_root().parent
+                self.properties["address"] = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
+                self.properties["size"] = self.fileobj.read_unknown_nr(superblock.length_size, 1)
+                
+            elif self.layout_class == "chunked":
+                self.properties["dimensionality"] = self.fileobj.read_struct_type("B", 1)
+                superblock = self.get_root().parent
+                self.properties["address"] = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
+                self.properties["dimsizes"] = [self.fileobj.read_struct_type("I", 1)
+                                               for _ in range(self.properties["dimensionality"])]
+                self.properties["delemsize"] = self.fileobj.read_struct_type("I", 1)
+
+        elif self.version == 4:
+            raise NotImplementedError("Data layout properties for version 4 not yet supported")
+
+    def read_data(self):
+        if self.version in (1,2):
+            fsdfsa
+
+        elif self.version == 3:
+            self.fileobj.seek(self.properties["address"])
+
+            # TODO: remember to read into the data according to dimensions wanted
+            
+            if self.layout_class == "compact":
+                raw = self.read_bytes(self.properties["size"])
+
+            elif self.layout_class == "contiguous":
+                raw = self.read_bytes(self.properties["size"])
+
+            elif self.layout_class == "chunked":
+                btree = _v1BTreeNode(self, self.fileobj)
+                data = btree.read_data()
+
+        elif self.version == 4:
+            fsdfsd
+
+        return data
 
 
 
 
+class _FillValueMessage(object):
+    def __init__(self, parent, fileobj=None):
+        self.parent = parent
+        
+        if fileobj:
+            self.fileobj = fileobj
+            self.read()
+        else:
+            # set superblock attrs from kwargs...
+            raise NotImplementedError("Building from scratch not yet supported")
 
+    def __str__(self):
+        from pprint import pformat
+        return "----- \n %r \n %s"%(self, pformat(self.__dict__, indent=4) )
 
+    def get_root(self):
+        obj = self
+        while hasattr(obj, "parent") and not isinstance(obj.parent, _SuperBlock):
+            obj = obj.parent
 
+        return obj
+
+    def read(self):
+        if not hasattr(self, "fileobj"):
+            raise Exception("Must be initiated with a fileobj in order to call read()")
+
+        self._read_version()
+        assert 0 < self.version <= 3
+
+        if self.version in (1,2):
+            raise NotImplementedError("Fill value for version 1 and 2 not yet supported")
+            #self._read_space_allocation_time()
+            #self._read_fill_value_write_time()
+            #self._read_fill_value_defined()
+            #self._read_size()
+            #self._read_fill_value()
+
+        elif self.version == 3:
+            self._read_flags()
+            self._read_size()
+            self._read_fill_value()
+
+    def _read_version(self):
+        self.version = self.fileobj.read_struct_type("B", 1)
+
+    def _read_flags(self):
+        raw = self.fileobj.read_bytes(1)
+        self.flags = dict(spacealloctime=_bitfield(raw,0,1),
+                          fillvalwritetime=_bitfield(raw,2,3),
+                          fillvalundef=_bitflag(raw,4),
+                          fillvaldef=_bitflag(raw,5),
+                          reserved=_bitfield(raw,6,7),
+                          )
+
+    def _read_size(self):
+        if self.flags["fillvaldef"]:
+            self.size = self.fileobj.read_struct_type("I", 1)
+
+        else:
+            self.size = None
+
+    def _read_fill_value(self):
+        if self.flags["fillvaldef"]:
+            # read as bytes, later interpret as same dtype as dataset
+            self.fill_value = self.fileobj.read_bytes(self.size) 
+
+        else:
+            self.fill_value = None
 
 
