@@ -19,7 +19,8 @@ for msg in root.messages:
         for submsg in msg["msgdata"].link.messages:
             if submsg["msgtype"] == 8:
                 print "??????????????????"
-                print submsg["msgdata"].read_data()
+                dat = submsg["msgdata"].read_data()
+                print len(dat), ":", str(dat)[:300] 
                 
 
 

@@ -44,6 +44,10 @@ class HDF5(object):
 # "Low level" objects as they actually exist on disk, for reading and writing
 # Link: https://www.hdfgroup.org/HDF5/doc/H5.format.html
 
+
+UNDEFINED = struct.unpack('<Q', b'\xff\xff\xff\xff\xff\xff\xff\xff')[0]
+
+
 def _bitflag(rawbyte, index):
     # loworder first
     # From: http://stackoverflow.com/questions/2576712/using-python-how-can-i-read-the-bits-in-a-byte
@@ -340,7 +344,9 @@ class _v1BTreeNode(_BaseObject):
         self._read_entries_used() 
         self._read_address_left()
         self._read_address_right()
-        self._read_keys()
+        
+        self._iter_start = self.fileobj.tell()
+        #self._read_keys()
         #self._read_k2_pluss_1()
 
     def _read_signature(self):
@@ -366,41 +372,109 @@ class _v1BTreeNode(_BaseObject):
         superblock = self.get_root().parent
         self.address_right = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
 
-    def _read_keys(self):
+    def __iter__(self):
         superblock = self.get_root().parent
-        self.keys = list()
+        self.fileobj.seek(self._iter_start)
         
         if self.node_type == 0:
+            # first key
+            prevkey = dict(offset=self.fileobj.read_unknown_nr(superblock.length_size, 1))
             for _ in range(self.entries_used):
+                # address
+                address = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
                 # key
                 key = dict(offset=self.fileobj.read_unknown_nr(superblock.length_size, 1))
-                # address
-                address = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
 
-                self.keys.append(dict(key=key, address=address))
+                yield prevkey, address, key
+                prevkey = key
 
         elif self.node_type == 1:
-            dataspace = next((msg["msgdata"] for msg in self.get_root_node().parent.parent.messages if msg["msgtype"] == 1))
+            datalayout = next((msg["msgdata"] for msg in self.get_root_node().parent.parent.messages if msg["msgtype"] == 8))
+            def read_key():
+                key = dict()
+
+                key["chunksize"] = self.fileobj.read_unknown_nr(4, 1)
+
+                raw = self.fileobj.read_bytes(4)
+                key["filtermask"] = [_bitflag(raw, i) for i in range(32)] # a list of flags for which filters to skip
+
+                offsets = list()
+                dims = datalayout.properties["dimensionality"] # assume version 3 specific, since this is implied by the chunked btree
+                for _ in range(dims):
+                    offsets.append(self.fileobj.read_struct_type("Q",1))
+                offsets.append(0)
+                key["offsets"] = offsets
+
+                return key
+
+            # first key
+            prevkey = read_key()
             for _ in range(self.entries_used):
-                # key
-                raw = self.fileobj.read_bytes(1)
-                key = dict(chunksize=_bitfield(raw,0,3),
-                           filtermask=_bitfield(raw,4,7),
-                           offsets=list(),
-                           )
-                for _ in range(dataspace.dimensionality):
-                    key["offsets"].append(self.fileobj.read_struct_type("Q",1))
-                key["offsets"].append(0)
                 # address
                 address = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
+                # key
+                key = read_key()
 
-                self.keys.append(dict(key=key, address=address))
+                yield prevkey, address, key
+                prevkey = key
 
     def read_data(self):
+        # dayalayout retrieves data by calling this method on the top btree node
+        # so this should get all data from all subnodes and subtrees readily structured for endusers
+        # should allow options such as which dimensions to get and which to set as constant
+
+        # what to do with left and right addresses???
+        # ...
+        
         # traverse the keys
         # depending on level, type, and keyinfo, offset and seek to address for data or subtree
-        # ...
-        pass
+        print "btree level", self.node_level, "type", self.node_type, "entries", self.entries_used
+        print "left",self.address_left,"right",self.address_right
+        data = []
+        if self.node_level > 0:
+            for key,child_pointer,key_plus_1 in list(self):
+                # TODO: must be offset, via child_pointer or key "offset" ???
+                print child_pointer,key,key_plus_1
+                pos = self.fileobj.tell()
+
+                # first one
+                self.fileobj.seek(child_pointer)
+                subnode = _v1BTreeNode(self, self.fileobj)
+                print "###",subnode
+                subdata = subnode.read_data()
+                data.append(subdata)
+
+                # also loop through all siblings of the subnode, ie right address until UNDEFINED
+                while subnode.right_address != UNDEFINED:
+                    print "###",subnode
+                    # check right sibling
+                    self.fileobj.seek(subnode.right_address)
+                    subnode = _v1BTreeNode(self, self.fileobj)
+                    subdata = subnode.read_data()
+                    data.append(subdata)
+                    
+                self.fileobj.seek(pos)
+                
+        elif self.node_level == 0:
+            for key,child_pointer,key_plus_1 in list(self):
+                self.fileobj.seek(child_pointer)
+                if self.node_type == 1:
+                    print ">>> leaf",child_pointer,key,key_plus_1
+                    # raw chunk data
+                    mainkey = key_plus_1 # describes least object in left child
+                    size = mainkey["chunksize"]
+                    print "size", size
+                    #raw_chunk = self.fileobj.read_unknown_nr(1, size) # temp read 1byte nrs
+                    #print "###",repr(raw_chunk)[:100]
+                    # TODO: correctly interpret data type and give correct shape
+                    #data.append(raw_chunk)
+                elif self.node_type == 0:
+                    # group node (new sub btree)
+                    mainkey = key # describes greatest object in right child
+                    symtable = SymbolTable(self, self.fileobj)
+                    # TODO: add to data...
+                    print "###",symtable
+        return data
 
 class _v2BTreeHeader(object):
     def __init__(self):
