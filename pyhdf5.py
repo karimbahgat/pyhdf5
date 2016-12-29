@@ -327,13 +327,35 @@ class _SuperBlock(object):
 
 class _v1BTreeNode(_BaseObject):
 
-    def get_root_node(self):
-        obj = self
-        while hasattr(obj, "parent") and isinstance(obj.parent, _v1BTreeNode):
-            obj = obj.parent
+    def get_top_node(self):
+        topnode = self
+        while isinstance(topnode.parent, _v1BTreeNode):
+            topnode = topnode.parent
+        return topnode
 
-        obj = obj.parent
-        return obj
+    def get_dimensionality(self):
+        topnode = self.get_top_node()
+            
+        if isinstance(topnode.parent, _DataLayoutMessage):
+            return topnode.parent.properties["dimensionality"] # assume version 3 specific, since this is implied by the chunked btree
+        else:
+            raise Exception("Checking BTree parent dimensionality for %s not yet supported" % self.parent)
+
+    def get_dimsizes(self):
+        topnode = self.get_top_node()
+            
+        if isinstance(topnode.parent, _DataLayoutMessage):
+            return topnode.parent.properties["dimsizes"] # assume version 3 specific, since this is implied by the chunked btree
+        else:
+            raise Exception("Checking BTree parent dimsizes for %s not yet supported" % self.parent)
+
+    def get_dtype(self):
+        obj = self
+        while not isinstance(obj, _ObjectHeader):
+            obj = obj.parent
+        for msg in obj.messages:
+            if isinstance(msg["msgdata"], _DataTypeMessage):
+                return msg["msgdata"]
 
     def read(self):
         self.fileobj.seek(self.pos)
@@ -345,10 +367,8 @@ class _v1BTreeNode(_BaseObject):
         self._read_address_left()
         self._read_address_right()
         
-        self._iter_start = self.fileobj.tell()
-        #self._read_keys()
-        #self._read_k2_pluss_1()
-
+        self._children_start = self.fileobj.tell()
+        
     def _read_signature(self):
         self.signature = self.fileobj.read_struct_type("s", 4)
         assert self.signature == "TREE"
@@ -372,9 +392,9 @@ class _v1BTreeNode(_BaseObject):
         superblock = self.get_root().parent
         self.address_right = self.fileobj.read_unknown_nr(superblock.offset_size, 1)
 
-    def __iter__(self):
+    def children(self):
         superblock = self.get_root().parent
-        self.fileobj.seek(self._iter_start)
+        self.fileobj.seek(self._children_start)
         
         if self.node_type == 0:
             # first key
@@ -389,7 +409,8 @@ class _v1BTreeNode(_BaseObject):
                 prevkey = key
 
         elif self.node_type == 1:
-            datalayout = next((msg["msgdata"] for msg in self.get_root_node().parent.parent.messages if msg["msgtype"] == 8))
+            dimensionality = self.get_dimensionality()
+            
             def read_key():
                 key = dict()
 
@@ -399,8 +420,7 @@ class _v1BTreeNode(_BaseObject):
                 key["filtermask"] = [_bitflag(raw, i) for i in range(32)] # a list of flags for which filters to skip
 
                 offsets = list()
-                dims = datalayout.properties["dimensionality"] # assume version 3 specific, since this is implied by the chunked btree
-                for _ in range(dims):
+                for _ in range(dimensionality):
                     offsets.append(self.fileobj.read_struct_type("Q",1))
                 offsets.append(0)
                 key["offsets"] = offsets
@@ -432,8 +452,7 @@ class _v1BTreeNode(_BaseObject):
         print "left",self.address_left,"right",self.address_right
         data = []
         if self.node_level > 0:
-            for key,child_pointer,key_plus_1 in list(self):
-                # TODO: must be offset, via child_pointer or key "offset" ???
+            for key,child_pointer,key_plus_1 in list(self.children()):
                 print child_pointer,key,key_plus_1
                 pos = self.fileobj.tell()
 
@@ -445,10 +464,10 @@ class _v1BTreeNode(_BaseObject):
                 data.append(subdata)
 
                 # also loop through all siblings of the subnode, ie right address until UNDEFINED
-                while subnode.right_address != UNDEFINED:
+                while subnode.address_right != UNDEFINED:
                     print "###",subnode
                     # check right sibling
-                    self.fileobj.seek(subnode.right_address)
+                    self.fileobj.seek(subnode.address_right)
                     subnode = _v1BTreeNode(self, self.fileobj)
                     subdata = subnode.read_data()
                     data.append(subdata)
@@ -456,8 +475,14 @@ class _v1BTreeNode(_BaseObject):
                 self.fileobj.seek(pos)
                 
         elif self.node_level == 0:
-            for key,child_pointer,key_plus_1 in list(self):
+            for key,child_pointer,key_plus_1 in list(self.children()):
                 self.fileobj.seek(child_pointer)
+
+                dtype = self.get_dtype()
+                endian,typ = dtype.get_struct_type()
+
+                dimsizes = self.get_dimsizes()
+                
                 if self.node_type == 1:
                     print ">>> leaf",child_pointer,key,key_plus_1
                     # raw chunk data
@@ -466,10 +491,18 @@ class _v1BTreeNode(_BaseObject):
                     print "size", size
                     #raw_chunk = self.fileobj.read_unknown_nr(1, size) # temp read 1byte nrs
                     #print "###",repr(raw_chunk)[:100]
-                    # TODO: correctly interpret data type and give correct shape
-                    #data.append(raw_chunk)
+                    
+                    # TODO: correctly interpret data type, read only wanted dimensions, and give correct shape
+                    chunknum = reduce(lambda init,nxt: init * nxt, dimsizes) # multiplying size of all chunk dims gives total chunk number of chunk items
+                    frmt = endian+bytes(chunknum)+typ
+                    raw = self.fileobj.fileobj.read(struct.calcsize(frmt))
+                    flat = struct.unpack(frmt, raw)
+                    #start = mainkey['offsets'][:-1] # last one is just junk
+                    #region = [slice(i, i+j) for i, j in zip(start, chunk_shape)]
+                    print "###",repr(flat)[:100]
+                    data.append(flat)
                 elif self.node_type == 0:
-                    # group node (new sub btree)
+                    # group node (when and why is this used instead of chunk???)
                     mainkey = key # describes greatest object in right child
                     symtable = SymbolTable(self, self.fileobj)
                     # TODO: add to data...
@@ -717,9 +750,10 @@ class _ObjectHeaderPrefix(object):
                 data = _LinkMessage(parent=self, fileobj=self.fileobj)
             elif typ == 8:
                 data = _DataLayoutMessage(parent=self, fileobj=self.fileobj)
-                print "LAYOUT",data
-            elif typ == 10:
+            elif typ == 16: # hex is 10 but nr is 16
                 data = _HeaderContMessage(parent=self, fileobj=self.fileobj)
+            # add next: 12 attrib, 21 attribute info, 11 filterpipeline, 10 groupinfo
+            # ...
             else:
                 data = "NOT YET SUPPORTED" #raise NotImplementedError("Message type %s not yet supported" % typ)
 
@@ -1164,6 +1198,41 @@ class _DataTypeMessage(object):
     def _read_properties(self):
         pass
 
+    def get_struct_type(self):
+        # NOTE: so far, we are ignoring several bitfields and dtype properties
+        # not sure if Python allows customizing all those options, eg mantissa, precision, etc...
+        
+        if self.classtype == "fixpoint":
+            endian = "<" if self.bitfields[0] == 0 else ">"
+
+            signed = self.bitfields[3]
+            if self.size == 2:
+                typ = "h" if signed else "H"
+            elif self.size == 4:
+                typ = "i" if signed else "I"
+            elif self.size == 8:
+                typ = "q" if signed else "Q"
+
+            return endian, typ
+
+        elif self.classtype == "floatpoint":
+            endianbits = self.bitfields[6],self.bitfields[0]
+            if endianbits == (0,0):
+                endian = "<"
+            elif endianbits == (0,1):
+                endian = ">"
+            else:
+                raise NotImplementedError("Floating point byte order not yet supported")
+
+            if self.size == 4:
+                typ = "f"
+            elif self.size == 8:
+                typ = "d"
+
+            return endian, typ
+
+        else:
+            raise NotImplementedError("Data type not yet supported")
 
             
 
