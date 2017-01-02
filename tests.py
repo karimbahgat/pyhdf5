@@ -1,4 +1,15 @@
 
+##import sys
+##sys.path.insert(0, "")
+##
+##import pyfive
+##print pyfive
+##
+##testfile = pyfive.File(r"C:\Users\kimo\Downloads\spei01.nc")
+##testfile["spei"]._dataobjects.get_data()
+##fdsdf
+
+
 from pyhdf5 import HDF5
 
 testfile = HDF5(r"C:\Users\kimo\Downloads\spei01.nc") #"testfiles/spei01.nc")
@@ -21,8 +32,8 @@ for msg in root.messages:
                 print "DATASPACE:", submsg["msgdata"]
             elif submsg["msgtype"] == 8:
                 print "DATALAYOUT:", submsg["msgdata"]
-                #dat = submsg["msgdata"].read_data()
-                #print len(dat), ":", str(dat)[:300]
+                dat = submsg["msgdata"].read_data()
+                print len(dat), ":", str(dat)[:300]
                 
 
 

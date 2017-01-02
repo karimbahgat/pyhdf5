@@ -357,6 +357,14 @@ class _v1BTreeNode(_BaseObject):
             if isinstance(msg["msgdata"], _DataTypeMessage):
                 return msg["msgdata"]
 
+    def get_datafilter_pipeline(self):
+        obj = self
+        while not isinstance(obj, _ObjectHeader):
+            obj = obj.parent
+        for msg in obj.messages:
+            if isinstance(msg["msgdata"], _FilterPipelineMessage):
+                return msg["msgdata"]
+            
     def read(self):
         self.fileobj.seek(self.pos)
         
@@ -475,13 +483,14 @@ class _v1BTreeNode(_BaseObject):
                 self.fileobj.seek(pos)
                 
         elif self.node_level == 0:
+            dtype = self.get_dtype()
+            endian,typ = dtype.get_struct_type()
+
+            dimsizes = self.get_dimsizes()
+            datafilter_pipeline = self.get_datafilter_pipeline()
+            
             for key,child_pointer,key_plus_1 in list(self.children()):
                 self.fileobj.seek(child_pointer)
-
-                dtype = self.get_dtype()
-                endian,typ = dtype.get_struct_type()
-
-                dimsizes = self.get_dimsizes()
                 
                 if self.node_type == 1:
                     print ">>> leaf",child_pointer,key,key_plus_1
@@ -493,18 +502,41 @@ class _v1BTreeNode(_BaseObject):
                     #print "###",repr(raw_chunk)[:100]
                     
                     # TODO: correctly interpret data type, read only wanted dimensions, and give correct shape
-                    chunknum = reduce(lambda init,nxt: init * nxt, dimsizes) # multiplying size of all chunk dims gives total chunk number of chunk items
-                    frmt = endian+bytes(chunknum)+typ
-                    raw = self.fileobj.fileobj.read(struct.calcsize(frmt))
+                    raw = self.fileobj.read_bytes(size)
+                    print len(raw)
+                    if datafilter_pipeline:
+                        # TODO: dont use datafilter if skip filter flag is set...
+                        raw = datafilter_pipeline.decode(raw)
+
+                    count = int(len(raw) / float(dtype.size))
+                    frmt = endian+bytes(count)+typ
+                    bufsize = struct.calcsize(frmt)
+                    print frmt, bufsize, len(raw)
+                    
                     flat = struct.unpack(frmt, raw)
+                    print len(flat)
+                    
+##                    count = reduce(lambda init,nxt: init * nxt, dimsizes) # multiplying size of all chunk dims gives total chunk number of chunk items
+##                    frmt = endian+bytes(count)+typ
+##                    bufsize = struct.calcsize(frmt)
+##                    raw = self.fileobj.fileobj.read(bufsize)
+##                    print len(raw)
+##                    if False: #datafilter:
+##                        # TODO: dont use datafilter if skip filter flag is set...
+##                        raw = datafilter_pipeline.decode(raw)
+##                    print frmt, bufsize, len(raw)
+##                    flat = struct.unpack(frmt, raw)
+##                    print len(flat)
                     #start = mainkey['offsets'][:-1] # last one is just junk
                     #region = [slice(i, i+j) for i, j in zip(start, chunk_shape)]
+                    
                     print "###",repr(flat)[:100]
                     data.append(flat)
+                    
                 elif self.node_type == 0:
                     # group node (when and why is this used instead of chunk???)
                     mainkey = key # describes greatest object in right child
-                    symtable = SymbolTable(self, self.fileobj)
+                    symtable = _SymbolTable(self, self.fileobj)
                     # TODO: add to data...
                     print "###",symtable
         return data
@@ -750,6 +782,8 @@ class _ObjectHeaderPrefix(object):
                 data = _LinkMessage(parent=self, fileobj=self.fileobj)
             elif typ == 8:
                 data = _DataLayoutMessage(parent=self, fileobj=self.fileobj)
+            elif typ == 11:
+                data = _FilterPipelineMessage(parent=self, fileobj=self.fileobj)
             elif typ == 16: # hex is 10 but nr is 16
                 data = _HeaderContMessage(parent=self, fileobj=self.fileobj)
             # add next: 12 attrib, 21 attribute info, 11 filterpipeline, 10 groupinfo
@@ -1142,6 +1176,7 @@ class _DataTypeMessage(object):
         else:
             # set superblock attrs from kwargs...
             raise NotImplementedError("Building from scratch not yet supported")
+        print self
 
     def __str__(self):
         from pprint import pformat
@@ -1234,7 +1269,173 @@ class _DataTypeMessage(object):
         else:
             raise NotImplementedError("Data type not yet supported")
 
+
+
+class _FilterPipelineMessage(object):
+    def __init__(self, parent, fileobj=None):
+        self.parent = parent
+        
+        if fileobj:
+            self.fileobj = fileobj
+            self.read()
+        else:
+            # set superblock attrs from kwargs...
+            raise NotImplementedError("Building from scratch not yet supported")
+        print self
+
+    def __str__(self):
+        from pprint import pformat
+        return "----- \n %r \n %s"%(self, pformat(self.__dict__, indent=4) )
+
+    def get_root(self):
+        obj = self
+        while hasattr(obj, "parent") and not isinstance(obj.parent, _SuperBlock):
+            obj = obj.parent
+
+        return obj
+
+    def decode(self, raw):
+        # run raw bytes through each filter in the pipeline???
+        # TODO: should also consider skip chunk filterflags, as well as optional flag...
+        for filt in self.filters:
+            if filt.filter_id == 1:
+                # deflate/gzip
+                # http://stackoverflow.com/questions/2695152/in-python-how-do-i-decode-gzip-encoding
+                #raw = raw.decode("zlib")
+                
+                #from cStringIO import StringIO
+                #from gzip import GzipFile
+                #raw = GzipFile(mode='rb', fileobj=StringIO(raw)).read()
+
+                import zlib
+                raw = zlib.decompress(raw, 16+zlib.MAX_WBITS) 
+            else:
+                raise NotImplementedError("Decoding filter id %s not yet supported" % self.filter_id)
+
+        return raw
+
+    def read(self):
+        if not hasattr(self, "fileobj"):
+            raise Exception("Must be initiated with a fileobj in order to call read()")
+
+        self._read_version()
+        
+        if self.version == 1:
+            self._read_numfilters()
+            self._read_reserved(2+4)
+
+            # filter description
+            self.filters = []
+            for _ in range(self.numfilters):
+                filt = _v1FilterDescription(self, self.fileobj)
+                self.filters.append(filt)
+
+        elif self.version == 2:
+            self._read_numfilters()
+
+            # filter description
+            self.filters = []
+            for _ in range(self.numfilters):
+                filt = _v2FilterDescription(self, self.fileobj)
+                self.filters.append(filt)
+                
+        else:
+            raise Exception("This version does not exist")
             
+    def _read_version(self):
+        self.version = self.fileobj.read_struct_type("B", 1)
+
+    def _read_numfilters(self):
+        self.numfilters = self.fileobj.read_unknown_nr(1, 1)
+
+    def _read_reserved(self, n):
+        self.fileobj.read_bytes(n)
+
+
+
+
+class _BaseFilterDescription(object):
+    def __init__(self, parent, fileobj=None):
+        self.parent = parent
+        
+        if fileobj:
+            self.fileobj = fileobj
+            self.read()
+        else:
+            # set superblock attrs from kwargs...
+            raise NotImplementedError("Building from scratch not yet supported")
+
+    def __str__(self):
+        from pprint import pformat
+        return "----- \n %r \n %s"%(self, pformat(self.__dict__, indent=4) )
+
+    def _read_filter_id(self):
+        self.filter_id = self.fileobj.read_unknown_nr(2, 1)
+        ##                            {0:"N/A",
+        ##                              1:"deflate",
+        ##                              2:"shuffle",
+        ##                              3:"fletcher32",
+        ##                              4:"szip",
+        ##                              5:"nbit",
+        ##                              6:"scaleoffset"}[self.fileobj.read_unknown_nr(2, 1)]
+
+    def _read_name_length(self):
+        self.name_length = self.fileobj.read_unknown_nr(2, 1)
+
+    def _read_flags(self):
+        raw = self.fileobj.read_bytes(2)
+        self.flags = dict(optional=_bitflag(raw, 0),
+                          )
+
+    def _read_numclientvalues(self):
+        self.numclientvalues = self.fileobj.read_unknown_nr(2, 1)
+
+    def _read_name(self):
+        self.name = self.fileobj.read_struct_type("s", self.name_length)
+
+    def _read_client_data(self):
+        if self.numclientvalues:
+            self.client_data = self.fileobj.read_unknown_nr(4, self.numclientvalues)
+        else:
+            self.client_data = []
+
+    def _read_padding(self):
+        assert self.fileobj.read_unknown_nr(1, 4) == (0,0,0,0)
+
+
+
+
+
+class _v1FilterDescription(_BaseFilterDescription):
+    def read(self):
+        self._read_filter_id()
+        self._read_name_length()
+        self._read_flags()
+        self._read_numclientvalues()
+        if self.name_length != 0:
+            self._read_name()
+            # TODO: pad to a multiple of 8??
+            # ...
+        self._read_client_data()
+        if self.numclientvalues % 2: # padding if odd value
+            self._read_padding()
+
+
+
+
+class _v2FilterDescription(_BaseFilterDescription):
+    def read(self):
+        self._read_filter_id()
+        if self.filter_id >= 256:
+            self._read_name_length() # not defined for ids less than 256
+        self._read_flags()
+        self._read_numclientvalues()
+        if self.filter_id >= 256 and self.name_length != 0:
+            self._read_name() # not defined for ids less than 256
+        self._read_client_data()
+        print self
+
+
 
 
 class _DataLayoutMessage(object):
