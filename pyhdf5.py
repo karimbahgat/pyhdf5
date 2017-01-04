@@ -495,7 +495,7 @@ class _v1BTreeNode(_BaseObject):
                 if self.node_type == 1:
                     print ">>> leaf",child_pointer,key,key_plus_1
                     # raw chunk data
-                    mainkey = key_plus_1 # describes least object in left child
+                    mainkey = key #key_plus_1 # describes least object in left child??
                     size = mainkey["chunksize"]
                     print "size", size
                     #raw_chunk = self.fileobj.read_unknown_nr(1, size) # temp read 1byte nrs
@@ -530,12 +530,12 @@ class _v1BTreeNode(_BaseObject):
                     #start = mainkey['offsets'][:-1] # last one is just junk
                     #region = [slice(i, i+j) for i, j in zip(start, chunk_shape)]
                     
-                    print "###",repr(flat)[:100]
+                    print "###",repr(flat)[:100], "nonmiss", len([v for v in flat if -10 < v < 10]), "max", max(flat), "min", min(flat)
                     data.append(flat)
                     
                 elif self.node_type == 0:
                     # group node (when and why is this used instead of chunk???)
-                    mainkey = key # describes greatest object in right child
+                    mainkey = key_plus_1 # key # describes greatest object in right child??
                     symtable = _SymbolTable(self, self.fileobj)
                     # TODO: add to data...
                     print "###",symtable
@@ -1308,7 +1308,9 @@ class _FilterPipelineMessage(object):
                 #raw = GzipFile(mode='rb', fileobj=StringIO(raw)).read()
 
                 import zlib
-                raw = zlib.decompress(raw, 16+zlib.MAX_WBITS) 
+                obj = zlib.decompressobj(32+zlib.MAX_WBITS) # autodetect gzip headers, and obj necessary to handle as stream and ignore incomplete tail
+                raw = obj.decompress(raw)
+                #raw = zlib.decompress(raw, 16+zlib.MAX_WBITS) 
             else:
                 raise NotImplementedError("Decoding filter id %s not yet supported" % self.filter_id)
 
